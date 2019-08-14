@@ -292,6 +292,9 @@ def query_cluster(
     cost_per_cpu = cluster_cost / cluster_allocatable["cpu"]
     cost_per_memory = cluster_cost / cluster_allocatable["memory"]
 
+    pct_use_by_cpu = 100 / cluster_allocatable["cpu"]
+    pct_use_by_memory = 100 / cluster_allocatable["memory"]
+
     for pod in Pod.objects(cluster.client, namespace=pykube.all):
         if pod.obj["status"].get("phase") != "Running":
             # ignore unschedulable/completed pods
@@ -316,12 +319,14 @@ def query_cluster(
             for k in ("cpu", "memory"):
                 nodes[pod.obj["spec"]["nodeName"]]["requests"][k] += requests.get(k, 0)
         cost = max(requests["cpu"] * cost_per_cpu, requests["memory"] * cost_per_memory)
+        pct_use = max(requests["cpu"] * pct_use_by_cpu, requests["memory"] * pct_use_by_memory)
         pods[(ns, pod.name)] = {
             "requests": requests,
             "application": application,
             "component": component,
             "container_images": container_images,
             "cost": cost,
+            "pct_use": pct_use,
             "usage": new_resources(),
         }
 
@@ -505,6 +510,7 @@ def resolve_application_ids(applications: dict, teams: dict, application_registr
                 {
                     "clusters": set(),
                     "applications": set(),
+                    "pct_use": 0,
                     "cost": 0,
                     "pods": 0,
                     "requests": {},
@@ -520,6 +526,7 @@ def resolve_application_ids(applications: dict, teams: dict, application_registr
                 team["usage"][r] = team["usage"].get(r, 0) + app.get("usage", {}).get(
                     r, 0
                 )
+            team["pct_use"] += app["pct_use"]
             team["cost"] += app["cost"]
             team["slack_cost"] += app["slack_cost"]
             teams[team_id] = team
@@ -627,6 +634,7 @@ def generate_report(
                 pod["application"],
                 {
                     "id": pod["application"],
+                    "pct_use": 0,
                     "cost": 0,
                     "slack_cost": 0,
                     "pods": 0,
@@ -643,6 +651,7 @@ def generate_report(
                     r, 0
                 )
             app["cost"] += pod["cost"]
+            app["pct_use"] += pod["pct_use"]
             app["slack_cost"] += pod.get("slack_cost", 0)
             app["pods"] += 1
             app["clusters"].add(cluster_id)
@@ -653,6 +662,7 @@ def generate_report(
                 (ns_pod[0], cluster_id),
                 {
                     "id": ns_pod[0],
+                    "pct_use": 0,
                     "cost": 0,
                     "slack_cost": 0,
                     "pods": 0,
@@ -668,6 +678,7 @@ def generate_report(
                 namespace["usage"][r] = namespace["usage"].get(r, 0) + pod.get("usage", {}).get(
                     r, 0
                 )
+            namespace["pct_use"] += pod["pct_use"]
             namespace["cost"] += pod["cost"]
             namespace["slack_cost"] += pod.get("slack_cost", 0)
             namespace["pods"] += 1
@@ -786,7 +797,7 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
     with out.open("teams.tsv") as csvfile:
         writer = csv.writer(csvfile, delimiter="\t")
         writer.writerow(["ID", "Clusters", "Applications", "Pods",
-                         "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cost [USD]", "Slack Cost [USD]"])
+                         "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cluster use in %", "Cost [USD]", "Slack Cost [USD]"])
         for team_id, team in sorted(teams.items()):
             writer.writerow([
                 team_id, len(team["clusters"]), len(team["applications"]), team["pods"],
@@ -794,12 +805,13 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
                 round(team["requests"]["memory"], 2),
                 round(team["usage"]["cpu"], 2),
                 round(team["usage"]["memory"], 2),
+                round(team["pct_use"], 2),
                 round(team["cost"], 2),
                 round(team["slack_cost"], 2)])
 
     with out.open("applications.tsv") as csvfile:
         writer = csv.writer(csvfile, delimiter="\t")
-        writer.writerow(["ID", "Team", "Clusters", "Pods", "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cost [USD]", "Slack Cost [USD]"])
+        writer.writerow(["ID", "Team", "Clusters", "Pods", "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cluster use in %", "Cost [USD]", "Slack Cost [USD]"])
         for app_id, app in sorted(applications.items()):
             writer.writerow([
                 app_id, app["team"], len(app["clusters"]), app["pods"],
@@ -807,12 +819,13 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
                 round(app["requests"]["memory"], 2),
                 round(app["usage"]["cpu"], 2),
                 round(app["usage"]["memory"], 2),
+                round(app["pct_use"], 2),
                 round(app["cost"], 2),
                 round(app["slack_cost"], 2)])
 
     with out.open("namespaces.tsv") as csvfile:
         writer = csv.writer(csvfile, delimiter="\t")
-        writer.writerow(["Name", "Status", "Cluster", "Pods", "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cost [USD]", "Slack Cost [USD]"])
+        writer.writerow(["Name", "Status", "Cluster", "Pods", "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cluster use in %", "Cost [USD]", "Slack Cost [USD]"])
         for cluster_id, namespace_item in sorted(namespace_usage.items()):
             fields = [
                 namespace_item["id"],
@@ -823,6 +836,7 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
                 round(namespace_item["requests"]["memory"], 2),
                 round(namespace_item["usage"]["cpu"], 2),
                 round(namespace_item["usage"]["memory"], 2),
+                round(namespace_item["pct_use"], 2),
                 round(namespace_item["cost"], 2),
                 round(namespace_item["slack_cost"], 2)
             ]
@@ -831,7 +845,7 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
     with out.open("pods.tsv") as csvfile:
         writer = csv.writer(csvfile, delimiter="\t")
         writer.writerow(["Cluster ID", "API Server URL", "Namespace", "Name", "Application", "Component", "Container Images",
-                         "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cost [USD]"])
+                         "CPU Requests", "Memory Requests", "CPU Usage", "Memory Usage", "Cluster use in %", "Cost [USD]"])
         with out.open("slack.tsv") as csvfile2:
             slackwriter = csv.writer(csvfile2, delimiter="\t")
             for cluster_id, summary in sorted(cluster_summaries.items()):
@@ -861,6 +875,7 @@ def write_report(out: OutputManager, start, notifications, cluster_summaries, na
                             requests["memory"],
                             usage["cpu"],
                             usage["memory"],
+                            pod["pct_use"],
                             pod["cost"]
                         ]
                     )
